@@ -2792,8 +2792,8 @@
         }
     },
     {
-        "uuid": "73fc41fe-3305-5fbb-9d88-08fca95846fc",
-        "description": "wcd_with_variant",
+        "uuid": "ae03bc21-485c-5175-9a41-7fc5421d62ef",
+        "description": "wcd_with_variant_simple",
         "input": {
             "name": "Memory Lapse",
             "variant": "Statue A Sideboard Shawn Hammer Regnier",

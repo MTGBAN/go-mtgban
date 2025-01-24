@@ -366,6 +366,12 @@ func Match(inCard *InputCard) (cardId string, err error) {
 				if err != nil {
 					continue
 				}
+
+				// Skip heuristics for WCD as short version would catch a lot
+				if inCard.isWorldChamp() {
+					break
+				}
+
 				if Contains(set.Name, inCard.Edition) ||
 					// If a card is promotional, only consider promotional sets
 					(inCard.isGenericPromo() && strings.HasSuffix(set.Name, "Promos")) ||
