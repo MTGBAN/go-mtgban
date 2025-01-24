@@ -13,6 +13,9 @@ import (
 
 const (
 	defaultConcurrency = 8
+
+	GameMagic   = "MTG"
+	GameLorcana = "LRC"
 )
 
 type Ninetyfive struct {
@@ -20,6 +23,7 @@ type Ninetyfive struct {
 	MaxConcurrency int
 
 	client *NFClient
+	game   string
 
 	inventoryDate time.Time
 	inventory     mtgban.InventoryRecord
@@ -27,12 +31,13 @@ type Ninetyfive struct {
 	buylist       mtgban.BuylistRecord
 }
 
-func NewScraper() (*Ninetyfive, error) {
+func NewScraper(game string) (*Ninetyfive, error) {
 	nf := Ninetyfive{}
 	nf.inventory = mtgban.InventoryRecord{}
 	nf.buylist = mtgban.BuylistRecord{}
 	nf.client = NewNFClient()
 	nf.MaxConcurrency = defaultConcurrency
+	nf.game = game
 	return &nf, nil
 }
 
@@ -51,7 +56,7 @@ var gradingMap = map[string]float64{
 
 func (nf *Ninetyfive) processPrices(allCards NFCard, allPrices NFPrice, mode string) error {
 	for key, items := range allPrices {
-		if allCards[key].SetSupertype != "MTG" {
+		if allCards[key].SetSupertype != nf.game {
 			continue
 		}
 		for sku, priceSet := range items {
@@ -81,19 +86,26 @@ func (nf *Ninetyfive) processPrices(allCards NFCard, allPrices NFPrice, mode str
 			}
 
 			foil := strings.HasSuffix(sku, "_true") || allCards[key].DedFoil == "yes"
-			theCard, err := preprocess(allCards, key, lang, foil)
-			if err != nil {
-				continue
-			}
 
-			cardId, err := mtgmatcher.Match(theCard)
+			var cardId string
+			if nf.game == GameMagic {
+				theCard, err := preprocess(allCards, key, lang, foil)
+				if err != nil {
+					continue
+				}
+
+				cardId, err = mtgmatcher.Match(theCard)
+			} else if nf.game == GameLorcana {
+				cardId, err = mtgmatcher.SimpleSearch(allCards[key].CardName, allCards[key].CardNum, foil)
+			} else {
+				err = errors.New("unsupported game")
+			}
 			if errors.Is(err, mtgmatcher.ErrUnsupported) {
 				continue
 			} else if err != nil {
 				var alias *mtgmatcher.AliasingError
 
 				nf.printf("%v", err)
-				nf.printf("%q", theCard)
 				nf.printf("%s: %q", key, allCards[key])
 				if alias != nil {
 					probes := alias.Probe()
@@ -272,5 +284,11 @@ func (nf *Ninetyfive) Info() (info mtgban.ScraperInfo) {
 	info.Shorthand = "95"
 	info.InventoryTimestamp = &nf.inventoryDate
 	info.BuylistTimestamp = &nf.buylistDate
+	switch nf.game {
+	case GameMagic:
+		info.Game = mtgban.GameMagic
+	case GameLorcana:
+		info.Game = mtgban.GameLorcana
+	}
 	return
 }

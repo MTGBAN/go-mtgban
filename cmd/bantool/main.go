@@ -266,7 +266,7 @@ var options = map[string]*scraperOption{
 	},
 	"ninetyfive": {
 		Init: func() (mtgban.Scraper, error) {
-			scraper, err := ninetyfive.NewScraper()
+			scraper, err := ninetyfive.NewScraper(ninetyfive.GameMagic)
 			if err != nil {
 				return nil, err
 			}
