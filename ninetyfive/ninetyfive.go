@@ -2,12 +2,13 @@ package ninetyfive
 
 import (
 	"errors"
-	"net/url"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/mtgban/go-mtgban/mtgban"
 	"github.com/mtgban/go-mtgban/mtgmatcher"
+	"golang.org/x/exp/maps"
 )
 
 const (
@@ -20,35 +21,19 @@ type Ninetyfive struct {
 
 	client *NFClient
 
-	exchangeRate float64
-
 	inventoryDate time.Time
 	inventory     mtgban.InventoryRecord
 	buylistDate   time.Time
 	buylist       mtgban.BuylistRecord
 }
 
-func NewScraper(altHost bool) (*Ninetyfive, error) {
+func NewScraper() (*Ninetyfive, error) {
 	nf := Ninetyfive{}
 	nf.inventory = mtgban.InventoryRecord{}
 	nf.buylist = mtgban.BuylistRecord{}
-	nf.client = NewNFClient(altHost)
+	nf.client = NewNFClient()
 	nf.MaxConcurrency = defaultConcurrency
-	nf.exchangeRate = 1.0
-	if altHost {
-		rate, err := mtgban.GetExchangeRate("EUR")
-		if err != nil {
-			return nil, err
-		}
-		nf.exchangeRate = rate
-	}
 	return &nf, nil
-}
-
-type respChan struct {
-	cardId   string
-	invEntry *mtgban.InventoryEntry
-	buyEntry *mtgban.BuylistEntry
 }
 
 func (nf *Ninetyfive) printf(format string, a ...interface{}) {
@@ -64,108 +49,127 @@ var gradingMap = map[string]float64{
 	"HP": 0.5,
 }
 
-func (nf *Ninetyfive) processPage(channel chan<- respChan, start int, mode string) error {
-	var products []NFProduct
-	var err error
-	if mode == "retail" {
-		products, err = nf.client.GetRetail(start)
-	} else if mode == "buylist" {
-		products, err = nf.client.GetBuylist(start)
-	}
-	if err != nil {
-		return nil
-	}
-
-	for _, product := range products {
-		if product.Quantity == 0 || product.Price <= 0 {
+func (nf *Ninetyfive) processPrices(allCards NFCard, allPrices NFPrice, mode string) error {
+	for key, items := range allPrices {
+		if allCards[key].SetSupertype != "MTG" {
 			continue
 		}
-
-		theCard, err := preprocess(&product)
-		if err != nil {
-			continue
-		}
-
-		cardId, err := mtgmatcher.Match(theCard)
-		if errors.Is(err, mtgmatcher.ErrUnsupported) {
-			continue
-		} else if err != nil {
-			// Both sides are present, ignore errors from doubles
-			if product.Card.Layout != "normal" {
-				continue
-			}
-
-			// No easy way to tell duplicates apart
-			var alias *mtgmatcher.AliasingError
-			if product.Card.Number == 0 && (errors.As(err, &alias) || theCard.Variation == "") {
-				continue
-			}
-
-			// Ignore errors from known incorrect cards (wrong cn)
-			if theCard.Edition == "Collectors' Edition" {
-				continue
-			}
-
-			nf.printf("%v", err)
-			nf.printf("%q", theCard)
-			nf.printf("%q", product)
-			if alias != nil {
-				probes := alias.Probe()
-				for _, probe := range probes {
-					card, _ := mtgmatcher.GetUUID(probe)
-					nf.printf("- %s", card)
+		for sku, priceSet := range items {
+			var quantity int
+			var priceStr string
+			var lang string
+			if mode == "retail" {
+				priceStr = priceSet.Price
+				quantity = priceSet.Quan
+				fields := strings.Split(sku, "_")
+				if len(fields) > 3 {
+					lang = fields[3]
 				}
-			}
-			continue
-		}
-
-		if mode == "retail" {
-			cond := product.Condition
-			if cond == "DMG" {
-				cond = "PO"
-			}
-			slug := product.Set.Slug
-			if slug == "" {
-				slug = product.Card.Set.Slug
+			} else if mode == "buylist" {
+				priceStr = priceSet.BuyPrice
+				quantity = priceSet.QuantityBuy
+				lang = sku
 			}
 
-			price := float64(product.Price) / 100 * nf.exchangeRate
-			link := "https://95mtg.com/singles/" + slug + "/" + product.Card.Slug
-			channel <- respChan{
-				cardId: cardId,
-				invEntry: &mtgban.InventoryEntry{
+			price, err := mtgmatcher.ParsePrice(priceStr)
+			if err != nil {
+				continue
+			}
+
+			if quantity == 0 || price == 0 {
+				continue
+			}
+
+			foil := strings.HasSuffix(sku, "_true") || allCards[key].DedFoil == "yes"
+			theCard, err := preprocess(allCards, key, lang, foil)
+			if err != nil {
+				continue
+			}
+
+			cardId, err := mtgmatcher.Match(theCard)
+			if errors.Is(err, mtgmatcher.ErrUnsupported) {
+				continue
+			} else if err != nil {
+				var alias *mtgmatcher.AliasingError
+
+				nf.printf("%v", err)
+				nf.printf("%q", theCard)
+				nf.printf("%s: %q", key, allCards[key])
+				if alias != nil {
+					probes := alias.Probe()
+					for _, probe := range probes {
+						card, _ := mtgmatcher.GetUUID(probe)
+						nf.printf("- %s", card)
+					}
+				}
+				continue
+			}
+
+			link := "https://shop.95gamecenter.com/app.php"
+			if mode == "retail" {
+				var cond string
+				switch {
+				// _MT_ case is skipped
+				case strings.Contains(sku, "_MT_"):
+					continue
+				case strings.Contains(sku, "_NM_"):
+					cond = "NM"
+				case strings.Contains(sku, "_LP_"):
+					cond = "SP"
+				case strings.Contains(sku, "_MP_"):
+					cond = "MP"
+				case strings.Contains(sku, "_HP_"):
+					cond = "HP"
+				case strings.Contains(sku, "_D_"):
+					cond = "PO"
+				default:
+					nf.printf("unknown SKU format: %s", sku)
+					continue
+				}
+
+				err = nf.inventory.Add(cardId, &mtgban.InventoryEntry{
 					Conditions: cond,
 					Price:      price,
-					Quantity:   product.Quantity,
+					Quantity:   quantity,
 					URL:        link,
-				},
-			}
-		} else if mode == "buylist" {
-			link := "https://95mtg.com/buylist/search/?name=" + url.QueryEscape(product.Card.Name)
-			var priceRatio, sellPrice float64
-
-			invCards := nf.inventory[cardId]
-			for _, invCard := range invCards {
-				sellPrice = invCard.Price
-				break
-			}
-
-			for _, grade := range mtgban.DefaultGradeTags {
-				price := float64(product.Price) / 100 * nf.exchangeRate * gradingMap[grade]
-
-				if sellPrice > 0 {
-					priceRatio = price / sellPrice * 100
+					OriginalId: key,
+					InstanceId: sku,
+				})
+			} else if mode == "buylist" {
+				idsToAdd := []string{cardId}
+				// Buylist for the foil version of the card is the same
+				cardFoilId, err := mtgmatcher.MatchId(cardId, true)
+				if err != nil && cardFoilId != "" && cardFoilId != cardId {
+					idsToAdd = append(idsToAdd, cardFoilId)
 				}
 
-				channel <- respChan{
-					cardId: cardId,
-					buyEntry: &mtgban.BuylistEntry{
-						Conditions: grade,
-						BuyPrice:   price,
-						PriceRatio: priceRatio,
-						URL:        link,
-					},
+				for _, id := range idsToAdd {
+					invCards := nf.inventory[id]
+					var sellPrice float64
+					var priceRatio float64
+					for _, invCard := range invCards {
+						sellPrice = invCard.Price
+						break
+					}
+					if sellPrice > 0 {
+						priceRatio = price / sellPrice * 100
+					}
+
+					for _, grade := range mtgban.DefaultGradeTags {
+						err = nf.buylist.Add(id, &mtgban.BuylistEntry{
+							Conditions: grade,
+							BuyPrice:   price * gradingMap[grade],
+							PriceRatio: priceRatio,
+							Quantity:   quantity,
+							URL:        link,
+							OriginalId: key,
+						})
+					}
 				}
+			}
+			// Todo check codes are correct
+			if err != nil && allCards[key].SetCode != "MB1" && allCards[key].SetCode != "pLIST" {
+				nf.printf("%s: %s", key, err.Error())
 			}
 		}
 	}
@@ -173,41 +177,34 @@ func (nf *Ninetyfive) processPage(channel chan<- respChan, start int, mode strin
 	return nil
 }
 
-func (nf *Ninetyfive) scrape(mode string) error {
-	var totalProducts int
-	var err error
-	if mode == "retail" {
-		totalProducts, err = nf.client.RetailTotals()
-	} else if mode == "buylist" {
-		totalProducts, err = nf.client.BuylistTotals()
-	} else {
-		err = errors.New("unknown mode")
-	}
+func (nf *Ninetyfive) getAllCards() (NFCard, error) {
+	list, err := nf.client.getIndexList()
 	if err != nil {
-		return err
+		return nil, err
 	}
 
-	pages := make(chan int)
-	channel := make(chan respChan)
+	pages := make(chan string)
+	channel := make(chan NFCard)
 	var wg sync.WaitGroup
 
-	nf.printf("Parsing %d items", totalProducts)
 	for i := 0; i < nf.MaxConcurrency; i++ {
 		wg.Add(1)
 		go func() {
-			for start := range pages {
-				err := nf.processPage(channel, start, mode)
+			for page := range pages {
+				cards, err := nf.client.getCards(page)
 				if err != nil {
-					nf.printf("%s", err.Error())
+					nf.printf("%s: %s", page, err.Error())
+					continue
 				}
+				channel <- cards
 			}
 			wg.Done()
 		}()
 	}
 
 	go func() {
-		for i := 1; i <= totalProducts/NFDefaultResultsPerPage+1; i++ {
-			pages <- i
+		for _, page := range list[1:] {
+			pages <- page
 		}
 		close(pages)
 
@@ -215,29 +212,33 @@ func (nf *Ninetyfive) scrape(mode string) error {
 		close(channel)
 	}()
 
+	allCards := NFCard{}
 	for record := range channel {
-		if record.invEntry != nil {
-			err := nf.inventory.Add(record.cardId, record.invEntry)
-			if err != nil {
-				nf.printf("%v", err)
-				continue
-			}
-		} else if record.buyEntry != nil {
-			err := nf.buylist.Add(record.cardId, record.buyEntry)
-			if err != nil {
-				nf.printf("%v", err)
-				continue
-			}
-		}
+		maps.Copy(allCards, record)
 	}
 
+	return allCards, nil
+}
+
+func (nf *Ninetyfive) scrape(mode string) error {
+	allCards, err := nf.getAllCards()
+	if err != nil {
+		return err
+	}
+	nf.printf("Loaded %d cards", len(allCards))
+
+	var allPrices NFPrice
 	if mode == "retail" {
-		nf.inventoryDate = time.Now()
-	} else if mode == "buylist" {
-		nf.buylistDate = time.Now()
+		allPrices, err = nf.client.getPrices()
+	} else {
+		allPrices, err = nf.client.getBuyPrices()
 	}
+	if err != nil {
+		return err
+	}
+	nf.printf("Loaded %d prices", len(allPrices))
 
-	return nil
+	return nf.processPrices(allCards, allPrices, mode)
 }
 
 func (nf *Ninetyfive) Inventory() (mtgban.InventoryRecord, error) {

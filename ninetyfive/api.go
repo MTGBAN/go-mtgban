@@ -5,133 +5,146 @@ import (
 	"fmt"
 	"io"
 	"net/url"
+	"strings"
 
 	retryablehttp "github.com/hashicorp/go-retryablehttp"
 )
 
 const (
-	NFDefaultResultsPerPage = 400
-
-	nfRetailURL  = "https://95mtg.com/api/products/?search=qnt:1;language_id:6;prices.price:0-649995;cmc:0-1000000;card.power:0-99;card.toughness:0-99;category_id:1;name:;foil:0|1;signed:0&searchJoin=and&perPage=30&page=1&orderBy=name&sortedBy=asc"
-	nfBuylistURL = "https://95mtg.com/api/buylists/?search=foil:0|1&searchJoin=and&perPage=1&page=1&orderBy=card.name&sortedBy=asc"
-
-	altHost = "eu.95mtg.com"
+	baseURL = "https://shop.95gamecenter.com/jsons"
 )
 
-type NFSearchResponse struct {
-	Code    string `json:"code"`
-	Message string `json:"message"`
-	Results struct {
-		Data []NFProduct `json:"data"`
-		Meta struct {
-			Pagination struct {
-				Total       int `json:"total"`
-				Count       int `json:"count"`
-				PerPage     int `json:"per_page"`
-				CurrentPage int `json:"current_page"`
-				TotalPages  int `json:"total_pages"`
-			} `json:"pagination"`
-		} `json:"meta"`
-	} `json:"results"`
-	Errors   []string `json:"errors"`
-	Redirect string   `json:"redirect"`
+type NFCard map[string]struct {
+	CardName     string `json:"card_name"`
+	SetName      string `json:"set_name"`
+	CardNum      string `json:"card_num"`
+	SetCode      string `json:"set_code"`
+	SetSupertype string `json:"set_supertype"`
+	DedFoil      string `json:"ded_foil"`
 }
 
-type NFProduct struct {
-	Language struct {
-		Code string `json:"code"`
-		Name string `json:"name"`
-	} `json:"language"`
-	Foil int `json:"foil"`
-	// Used in retail
-	Condition string `json:"condition"`
-	// Used in buylist
-	Conditions []string `json:"conditions"`
-	Price      int      `json:"price"`
-	Currency   struct {
-		Code string `json:"code"`
-		Name string `json:"name"`
-	} `json:"currency"`
-	Quantity int    `json:"qnt"`
-	Card     NFCard `json:"card"`
-	// Present in retail but not buylist
-	Set NFSet `json:"set"`
-}
+// example for sell prices
+//
+//	"pG07_6": {
+//	  "pG07_6_MT_EN_true": {},
+//	  "pG07_6_NM_EN_true": {},
+//	  "pG07_6_LP_EN_true": {}
+//	}
+//
+// example for buy prices
+//
+//	"FDN_227": {
+//	  "EN": {}
+//	}
+type NFPrice map[string]map[string]struct {
+	// Only for sell prices
+	Quan  int    `json:"quan,omitempty,string"`
+	Price string `json:"price,omitempty"`
 
-type NFCard struct {
-	Name string `json:"name"`
-	Slug string `json:"slug"`
-	// Present in buylist but not retail
-	Set    NFSet  `json:"set"`
-	Number int    `json:"number"`
-	Layout string `json:"layout"`
-}
-
-type NFSet struct {
-	Code string `json:"code"`
-	Name string `json:"name"`
-	Slug string `json:"slug"`
+	// Only for buy prices
+	BuyPrice    string `json:"buy_price,omitempty"`
+	CardLang    string `json:"card_lang,omitempty"`
+	QuantityBuy int    `json:"quantity_buy,omitempty,string"`
 }
 
 type NFClient struct {
-	client  *retryablehttp.Client
-	altHost bool
+	client *retryablehttp.Client
 }
 
-func NewNFClient(altHost bool) *NFClient {
+func NewNFClient() *NFClient {
 	nf := NFClient{}
 	nf.client = retryablehttp.NewClient()
 	nf.client.Logger = nil
-	nf.altHost = altHost
 	return &nf
 }
 
-func (nf *NFClient) RetailTotals() (int, error) {
-	resp, err := nf.query(nfRetailURL, 0, 1)
-	if err != nil {
-		return 0, err
-	}
-	return resp.Results.Meta.Pagination.Total, nil
-}
-
-func (nf *NFClient) GetRetail(start int) ([]NFProduct, error) {
-	resp, err := nf.query(nfRetailURL, start, NFDefaultResultsPerPage)
-	if err != nil {
-		return nil, err
-	}
-	return resp.Results.Data, nil
-}
-
-func (nf *NFClient) BuylistTotals() (int, error) {
-	resp, err := nf.query(nfBuylistURL, 0, 1)
-	if err != nil {
-		return 0, err
-	}
-	return resp.Results.Meta.Pagination.Total, nil
-}
-
-func (nf *NFClient) GetBuylist(start int) ([]NFProduct, error) {
-	resp, err := nf.query(nfBuylistURL, start, NFDefaultResultsPerPage)
-	if err != nil {
-		return nil, err
-	}
-	return resp.Results.Data, nil
-}
-
-func (nf *NFClient) query(searchURL string, start, maxResults int) (*NFSearchResponse, error) {
-	u, err := url.Parse(searchURL)
+func (nf *NFClient) getIndexList() ([]string, error) {
+	data, err := nf.getFile("card_index", "[")
 	if err != nil {
 		return nil, err
 	}
 
-	if nf.altHost {
-		u.Host = altHost
+	var list []string
+	err = json.Unmarshal(data, &list)
+	if err != nil {
+		return nil, err
 	}
 
-	q := u.Query()
-	q.Set("page", fmt.Sprint(start))
-	q.Set("perPage", fmt.Sprint(maxResults))
-	u.RawQuery = q.Encode()
+	return list, nil
+}
+
+func (nf *NFClient) getPrices() (NFPrice, error) {
+	data, err := nf.getFile("sku_index", "[")
+	if err != nil {
+		return nil, err
+	}
+
+	var list []string
+	err = json.Unmarshal(data, &list)
+	if err != nil {
+		return nil, err
+	}
+
+	data, err = nf.getFile(list[0], "{")
+	if err != nil {
+		return nil, err
+	}
+
+	var prices NFPrice
+	err = json.Unmarshal(data, &prices)
+	if err != nil {
+		return nil, err
+	}
+
+	return prices, nil
+}
+
+func (nf *NFClient) getBuyPrices() (NFPrice, error) {
+	data, err := nf.getFile("price_index", "[")
+	if err != nil {
+		return nil, err
+	}
+
+	var list []string
+	err = json.Unmarshal(data, &list)
+	if err != nil {
+		return nil, err
+	}
+
+	data, err = nf.getFile(list[0], "{")
+	if err != nil {
+		return nil, err
+	}
+
+	var prices NFPrice
+	err = json.Unmarshal(data, &prices)
+	if err != nil {
+		return nil, err
+	}
+
+	return prices, nil
+}
+
+func (nf *NFClient) getCards(name string) (NFCard, error) {
+	data, err := nf.getFile(name, "{")
+	if err != nil {
+		return nil, err
+	}
+
+	var card NFCard
+	err = json.Unmarshal(data, &card)
+	if err != nil {
+		return nil, err
+	}
+
+	return card, nil
+}
+
+func (nf *NFClient) getFile(name, separator string) ([]byte, error) {
+	u, err := url.Parse(baseURL + "/" + name + ".js")
+	if err != nil {
+		return nil, err
+	}
 
 	resp, err := nf.client.Get(u.String())
 	if err != nil {
@@ -144,11 +157,13 @@ func (nf *NFClient) query(searchURL string, start, maxResults int) (*NFSearchRes
 		return nil, err
 	}
 
-	var search NFSearchResponse
-	err = json.Unmarshal(data, &search)
-	if err != nil {
-		return nil, err
+	base := string(data)
+	base = strings.Replace(base, "TL;DR", "TLDR", 1)
+	base = strings.Split(base, ";")[0]
+	idx := strings.Index(base, separator)
+	if idx == -1 {
+		return nil, fmt.Errorf("malformed file %s", name)
 	}
 
-	return &search, nil
+	return []byte(base[idx:]), nil
 }
